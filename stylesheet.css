@@ -1,0 +1,21 @@
+.codenotch-cell { border-radius: 10px; padding: 0; background-color: transparent; }
+.codenotch-cell:hover { background-color: transparent; }
+.codenotch-cell:focus { background-color: #242424; }
+.codenotch-percent { font-size: 14px; font-weight: 600; color: #ffffff; text-align: center; }
+.codenotch-detail-wrap { spacing: 0; }
+.codenotch-detail { background-color: #000000; color: #ffffff; border-radius: 16px; spacing: 12px; box-shadow: 0 6px 18px 0 rgba(0, 0, 0, 0.32); }
+.codenotch-title { font-size: 16px; font-weight: 600; color: #ffffff; }
+.codenotch-muted { color: #a0a0a0; font-size: 11px; }
+.codenotch-window { spacing: 0; }
+.codenotch-window-title { font-size: 12px; font-weight: 400; color: #ffffff; }
+.codenotch-warning { color: #ff855c; font-size: 12px; }
+.codenotch-hairline { background-color: #303030; margin-top: 2px; margin-bottom: 2px; }
+.codenotch-action { padding: 7px 12px; border-radius: 8px; background-color: #242424; color: #ffffff; font-size: 12px; }
+.codenotch-action:hover { background-color: #343434; }
+.codenotch-action:focus { background-color: #404040; box-shadow: inset 0 0 0 1px #a0a0a0; }
+
+.codenotch-actions { spacing: 8px; }
+.codenotch-settings { padding: 0; border-radius: 16px; background-color: #000000; color: #d0d0d0; }
+.codenotch-settings:hover { background-color: #202020; color: #ffffff; }
+.codenotch-settings:focus { color: #ffffff; box-shadow: inset 0 0 0 1px #a0a0a0; }
+.codenotch-settings:active { background-color: #303030; }

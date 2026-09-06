@@ -1,0 +1,9 @@
+{
+  "uuid": "codenotch@local",
+  "name": "CodeNotch",
+  "description": "Coding assistant usage limits in a small screen-edge notch. Ubuntu GNOME port of vinzdg/codenotch.",
+  "shell-version": ["46"],
+  "version": 1,
+  "settings-schema": "org.gnome.shell.extensions.codenotch",
+  "url": "https://github.com/vinzdg/codenotch"
+}

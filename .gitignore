@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+schemas/gschemas.compiled
+dist/
+.smoke/
+.design-frames/
+codenotch-shot-*.png
