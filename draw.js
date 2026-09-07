@@ -1,26 +1,11 @@
 import {remainingPercent} from './model.js';
-import {LAYOUT, PALETTE, PROVIDER_COLORS, hexToRgb} from './design.js';
+import {LAYOUT, PALETTE, PROVIDER_COLORS, hexToRgb, notchGeometry, clampUnit} from './design.js';
 import {GLYPH_OUTLINES, GLYPH_SCALE, GLYPHS} from './glyphs.js';
 
-export function traceNotchPath(cr, w, h, edge, expanded) {
-    if (!expanded) {
-        const pillW = edge === 'left' || edge === 'right' ? LAYOUT.pillWidth : LAYOUT.pillHeight;
-        const pillH = edge === 'left' || edge === 'right' ? LAYOUT.pillHeight : LAYOUT.pillWidth;
-        const r = Math.min(8, pillW / 2, pillH / 2);
-        cr.newSubPath();
-        cr.arc(r, r, r, Math.PI, Math.PI * 1.5);
-        cr.arc(pillW - r, r, r, Math.PI * 1.5, 0);
-        cr.arc(pillW - r, pillH - r, r, 0, Math.PI * 0.5);
-        cr.arc(r, pillH - r, r, Math.PI * 0.5, Math.PI);
-        cr.closePath();
-        return;
-    }
+export function traceNotchPath(cr, w, h, edge) {
     const depth = edge === 'left' || edge === 'right' ? w : h;
     const length = edge === 'left' || edge === 'right' ? h : w;
-    const flare = LAYOUT.curlRadius;
-    const wanted = Math.max(0, Math.min(LAYOUT.cornerRadius, depth / 2));
-    const curl = Math.max(0, Math.min(flare, length / 2, depth - wanted));
-    const corner = Math.max(0, Math.min(wanted, (length - 2 * curl) / 2));
+    const {curl, corner} = notchGeometry(depth, length);
     const bodyTop = curl;
     const bodyBottom = length - curl;
     const bezel = depth;
@@ -40,22 +25,22 @@ export function traceNotchPath(cr, w, h, edge, expanded) {
     cr.closePath();
 }
 
-export function drawFilledPath(cr, pathFn, w, h, edge, expanded, fill = PALETTE.notch) {
+export function drawFilledPath(cr, pathFn, w, h, edge, fill = PALETTE.notch) {
     cr.save();
     if (edge === 'left') {
         cr.translate(w, 0);
         cr.scale(-1, 1);
-        pathFn(cr, w, h, 'right', expanded);
+        pathFn(cr, w, h, 'right');
     } else if (edge === 'top') {
         cr.translate(0, h);
         cr.rotate(-Math.PI / 2);
-        pathFn(cr, h, w, 'right', expanded);
+        pathFn(cr, h, w, 'right');
     } else if (edge === 'bottom') {
         cr.translate(w, 0);
         cr.rotate(Math.PI / 2);
-        pathFn(cr, h, w, 'right', expanded);
+        pathFn(cr, h, w, 'right');
     } else {
-        pathFn(cr, w, h, 'right', expanded);
+        pathFn(cr, w, h, 'right');
     }
     const rgb = hexToRgb(fill);
     cr.setSourceRGBA(...rgb, 1);
@@ -177,3 +162,50 @@ export function drawTooltipTail(cr, w, h, direction) {
     cr.fill();
 }
 
+
+// Arc and disc share the lower flare's centre. The canvas is deliberately
+// larger than the hit target so the closing arc can grow into the notch.
+export function drawSettings(cr, size, edge, hover, reveal) {
+    const h = clampUnit(hover);
+    const visible = clampUnit(reveal);
+    const radius = LAYOUT.curlRadius - LAYOUT.settingsGap;
+    const merge = 1 + (1 - reveal) * ((LAYOUT.curlRadius + LAYOUT.settingsStroke) / radius - 1);
+    const start = {right: -Math.PI / 2, left: Math.PI, top: Math.PI, bottom: Math.PI / 2}[edge];
+    cr.save();
+    cr.translate(size / 2, size / 2);
+    cr.scale(merge, merge);
+    cr.setSourceRGBA(0, 0, 0, (1 - h) * visible);
+    cr.setLineWidth(LAYOUT.settingsStroke);
+    cr.setLineCap(1);
+    cr.arc(0, 0, radius * (1 - 0.14 * h), start, start + Math.PI / 2);
+    cr.stroke();
+    cr.setSourceRGBA(0, 0, 0, h * visible);
+    cr.arc(0, 0, LAYOUT.settingsSize / 2 * (1.1 - 0.1 * hover), 0, Math.PI * 2);
+    cr.fill();
+    cr.restore();
+}
+
+// Eight outlined teeth and a circular hub, like the reference gearshape.
+export function drawSettingsGlyph(cr, size) {
+    const radius = size / 2 - 1;
+    const root = radius * 0.76;
+    cr.save();
+    cr.translate(size / 2, size / 2);
+    cr.setSourceRGBA(1, 1, 1, 1);
+    cr.setLineWidth(1.5);
+    cr.setLineJoin(1);
+    cr.newSubPath();
+    for (let tooth = 0; tooth < 8; tooth++) {
+        for (const [phase, r] of [[-0.5, root], [-0.3, root], [-0.16, radius], [0.16, radius], [0.3, root]]) {
+            const angle = (tooth + phase) * Math.PI / 4;
+            const x = Math.cos(angle) * r, y = Math.sin(angle) * r;
+            if (tooth === 0 && phase === -0.5) cr.moveTo(x, y);
+            else cr.lineTo(x, y);
+        }
+    }
+    cr.closePath();
+    cr.stroke();
+    cr.arc(0, 0, size * 0.16, 0, Math.PI * 2);
+    cr.stroke();
+    cr.restore();
+}

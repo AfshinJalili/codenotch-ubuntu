@@ -27,8 +27,8 @@ export const LAYOUT = {
     padTop: px(69.5),
     padBottom: px(50.1),
     cellSpacing: px(83.5),
-    pillWidth: 6,
-    pillHeight: 56,
+    pillWidth: px(26),
+    pillHeight: px(210),
     pillHotZone: px(90),
     ringDiameter: px(117),
     trackStroke: px(15.5),
@@ -37,8 +37,11 @@ export const LAYOUT = {
     ringLabelGap: px(26.9),
     activityDiameter: px(72),
     activityStroke: px(5.5),
-    settingsSize: 32,
-    settingsGap: 6,
+    settingsSize: px(124),
+    settingsStroke: px(18),
+    settingsGap: px(27),
+    settingsGlyph: px(56),
+    settingsHotZone: px(152),
     cardWidth: 300,
     cardCorner: px(49.5),
     cardPadding: 16,
@@ -101,12 +104,28 @@ export function hexToRgb(hex) {
     return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
 }
 
-export function easeOutBack(t) {
-    const c1 = 1.70158;
-    const c3 = c1 + 1;
-    return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2;
+// Damped spring with velocity carried across pointer reversals. Response and
+// damping match the reference's NotchMotion.swift; time is in seconds.
+export function springSample(value, target, velocity, time, response = 0.42, damping = 0.78) {
+    const omega = 2 * Math.PI / response;
+    const decay = damping * omega;
+    const frequency = omega * Math.sqrt(1 - damping * damping);
+    const displacement = value - target;
+    const sine = (velocity + decay * displacement) / frequency;
+    const envelope = Math.exp(-decay * time);
+    const wave = displacement * Math.cos(frequency * time) + sine * Math.sin(frequency * time);
+    return {
+        value: target + envelope * wave,
+        velocity: envelope * (-decay * wave - displacement * frequency * Math.sin(frequency * time)
+            + sine * frequency * Math.cos(frequency * time)),
+    };
 }
 
-export function easeIn(t) {
-    return t * t;
+export const clampUnit = value => Math.max(0, Math.min(1, value));
+
+export function notchGeometry(depth, length) {
+    const wanted = Math.max(0, Math.min(LAYOUT.cornerRadius, depth / 2));
+    const curl = Math.max(0, Math.min(LAYOUT.curlRadius, length / 2, depth - wanted));
+    const corner = Math.max(0, Math.min(wanted, (length - 2 * curl) / 2));
+    return {curl, corner};
 }

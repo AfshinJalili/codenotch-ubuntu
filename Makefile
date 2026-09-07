@@ -1,6 +1,6 @@
-.PHONY: test package install smoke dev-link reload
+.PHONY: test package install smoke dev-link reload demo-assets
 test:
-	node --test tests/model.test.js
+	node --test tests/*.test.js
 	python3 -m unittest discover -s tests -p 'test_*.py' -v
 	glib-compile-schemas --strict schemas
 	node --check extension.js
@@ -15,6 +15,8 @@ install:
 	python3 scripts/install.py
 smoke:
 	python3 scripts/smoke.py
+demo-assets: smoke
+	python3 scripts/export_demo_assets.py
 dev-link:
 	@rm -rf $(HOME)/.local/share/gnome-shell/extensions/codenotch@local
 	@ln -sfn $(CURDIR) $(HOME)/.local/share/gnome-shell/extensions/codenotch@local

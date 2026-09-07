@@ -8,8 +8,8 @@ import Pango from 'gi://Pango';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {PROVIDERS, NAMES, position, percentage, resetText, normalize, usageSummary, remainingPercent} from './model.js';
-import {LAYOUT, shapeLength, easeOutBack, easeIn} from './design.js';
-import {drawFilledPath, traceNotchPath, drawRing, drawProgressBar, drawTooltipTail, drawGlyph} from './draw.js';
+import {LAYOUT, shapeLength, springSample, clampUnit, notchGeometry} from './design.js';
+import {drawFilledPath, traceNotchPath, drawRing, drawProgressBar, drawTooltipTail, drawGlyph, drawSettings, drawSettingsGlyph} from './draw.js';
 
 export default class CodeNotch extends Extension {
     enable() {
@@ -26,40 +26,62 @@ export default class CodeNotch extends Extension {
         this._expandT = this._expanded ? 1 : 0;
         this._expandTarget = this._expandT;
         this._orbHover = false;
+        this._orbT = 0;
+        this._orbVelocity = 0;
+        this._expandVelocity = 0;
+        this._orbReveal = this._expandT;
+        this._orbRevealVelocity = 0;
+        this._cellMotion = new Map();
         this._refreshing = new Set();
 
-        this._host = new St.Widget({reactive: true, track_hover: true, layout_manager: new Clutter.BinLayout()});
+        this._host = new St.Widget({reactive: true, track_hover: true, clip_to_allocation: true});
         this._notchBg = new St.DrawingArea({reactive: false});
         this._stack = new St.BoxLayout({vertical: true, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.START});
         this._host.add_child(this._notchBg);
         this._host.add_child(this._stack);
         this._detail = new St.BoxLayout({style_class: 'codenotch-detail-wrap', reactive: true, track_hover: true, visible: false});
+        // Horizontal boxes default to width-for-height. This popup instead needs
+        // its constrained card width to determine wrapped text's natural height.
+        this._detail.request_mode = Clutter.RequestMode.HEIGHT_FOR_WIDTH;
         this._orb = new St.Button({
             style_class: 'codenotch-settings', can_focus: true, track_hover: true,
-            accessible_name: 'CodeNotch settings', visible: false, opacity: 190,
-            child: new St.Icon({icon_name: 'emblem-system-symbolic', icon_size: 16}),
+            accessible_name: 'CodeNotch settings', visible: false,
+        });
+        this._orbDrawing = new St.DrawingArea({width: 104, height: 104,
+            x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
+        this._orbGlyph = new St.DrawingArea({width: Math.round(LAYOUT.settingsGlyph),
+            height: Math.round(LAYOUT.settingsGlyph), opacity: 0,
+            x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
+        this._orbGlyph.connect('repaint', area => {
+            const cr = area.get_context();
+            drawSettingsGlyph(cr, area.get_surface_size()[0]);
+            cr.$dispose();
+        });
+        this._orbGlyph.set_pivot_point(0.5, 0.5);
+        this._orb.set_child(this._orbGlyph);
+        this._orbDrawing.connect('repaint', area => {
+            const cr = area.get_context();
+            drawSettings(cr, area.get_surface_size()[0], this._edge(), this._orbT, this._orbReveal);
+            cr.$dispose();
         });
 
         Main.layoutManager.addChrome(this._host, {affectsStruts: false, trackFullscreen: true});
         // Shell owns fullscreen visibility on the wrapper; only we own whether
         // the settings button is shown. Overview may show tracked chrome again.
-        this._orbChrome = new St.Widget({layout_manager: new Clutter.BinLayout()});
+        this._orbChrome = new St.Widget();
+        this._orbChrome.add_child(this._orbDrawing);
         this._orbChrome.add_child(this._orb);
         Main.layoutManager.addChrome(this._orbChrome, {affectsStruts: false, trackFullscreen: true});
-        this._mountDetail();
-
         this._host.connect('notify::hover', () => this._hover());
         this._detail.connect('notify::hover', () => this._hover());
         this._orb.connect('notify::hover', () => {
             this._orbHover = this._orb.hover;
-            this._orb.remove_all_transitions();
-            this._orb.ease({
-                opacity: this._orbHover ? 255 : 190,
-                duration: St.Settings.get().enable_animations ? 140 : 0,
-                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-            });
+            this._animateSettings();
+            if (this._orbHover) this._hideDetail();
             this._hover();
         });
+        this._orb.connect('key-focus-in', () => this._animateSettings());
+        this._orb.connect('key-focus-out', () => this._animateSettings());
         this._orb.connect('clicked', () => this.openPreferences());
         this._orb.connect('key-press-event', (_a, e) => this._key(e));
         this._notchBg.connect('repaint', area => {
@@ -68,7 +90,7 @@ export default class CodeNotch extends Extension {
             cr.setOperator(3);
             cr.paint();
             cr.setOperator(2);
-            drawFilledPath(cr, traceNotchPath, w, h, this._edge(), this._expandT > 0.05);
+            drawFilledPath(cr, traceNotchPath, w, h, this._edge());
             cr.$dispose();
         });
         this._host.connect('notify::allocation', () => this._place());
@@ -81,9 +103,14 @@ export default class CodeNotch extends Extension {
         this._workSignal = global.display.connect('workareas-changed', () => {
             this._place();
             GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                if (this._alive && this._overviewActive()) this._hideDetail(true);
+                if (this._alive && this._overviewActive()) this._hideDetail();
                 return GLib.SOURCE_REMOVE;
             });
+        });
+        this._workspaceSignal = global.workspace_manager.connect('active-workspace-changed', () => {
+            this._keyboardOpen = false;
+            this._hideDetail();
+            this._hover();
         });
         this._overviewShowingSignal = Main.overview.connect('showing', () => this._onOverviewShowing());
         this._overviewHidingSignal = Main.overview.connect('hiding', () => this._onOverviewHiding());
@@ -148,30 +175,120 @@ export default class CodeNotch extends Extension {
     _animateMotion() {
         if (this._motionTimer) GLib.Source.remove(this._motionTimer);
         this._motionTimer = 0;
-        const reduce = this._overviewActive() || !St.Settings.get().enable_animations;
-        if (reduce) {
-            this._expandT = this._expandTarget;
-            this._render();
+        const target = this._expandTarget;
+        if (this._overviewActive() || !St.Settings.get().enable_animations) {
+            this._expandT = this._orbReveal = target;
+            this._expandVelocity = this._orbRevealVelocity = 0;
+            for (const id of this._enabled()) this._cellMotion.set(id, {value: target, velocity: 0});
+            this._updateMotion();
             return;
         }
-        const start = this._expandT;
-        const target = this._expandTarget;
+        const start = {value: this._expandT, velocity: this._expandVelocity};
+        const reveal = {value: this._orbReveal, velocity: this._orbRevealVelocity};
+        const cells = new Map(this._cellMotion);
         const t0 = GLib.get_monotonic_time();
-        const duration = target > start ? 420000 : 200000;
         this._motionTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
-            const t = Math.min(1, (GLib.get_monotonic_time() - t0) / duration);
-            const eased = target > start ? easeOutBack(t) : easeIn(t);
-            this._expandT = start + (target - start) * eased;
-            this._render();
-            if (t >= 1) {
-                this._expandT = target;
-                GLib.Source.remove(this._motionTimer);
-                this._motionTimer = 0;
-                this._render();
-                return GLib.SOURCE_REMOVE;
+            const seconds = (GLib.get_monotonic_time() - t0) / 1000000;
+            const shape = springSample(start.value, target, start.velocity, seconds);
+            this._expandT = shape.value;
+            this._expandVelocity = shape.velocity;
+            this._enabled().forEach((id, index) => {
+                const from = cells.get(id) ?? start;
+                const time = Math.max(0, seconds - Math.min(index * 0.045, 0.18));
+                this._cellMotion.set(id, springSample(from.value, target, from.velocity, time, 0.36, 0.82));
+            });
+            if (target === 0) {
+                const t = Math.min(1, seconds / 0.2);
+                this._orbReveal = reveal.value * (1 - t * t);
+                this._orbRevealVelocity = 0;
+            } else {
+                const time = Math.max(0, seconds - Math.min(this._enabled().length * 0.045, 0.18));
+                const sample = springSample(reveal.value, target, reveal.velocity, time, 0.36, 0.82);
+                this._orbReveal = sample.value;
+                this._orbRevealVelocity = sample.velocity;
             }
-            return GLib.SOURCE_CONTINUE;
+            if (seconds >= 0.8) {
+                this._expandT = this._orbReveal = target;
+                this._expandVelocity = this._orbRevealVelocity = 0;
+                for (const id of this._enabled()) this._cellMotion.set(id, {value: target, velocity: 0});
+                this._motionTimer = 0;
+            }
+            this._updateMotion();
+            return this._motionTimer ? GLib.SOURCE_CONTINUE : GLib.SOURCE_REMOVE;
         });
+    }
+
+    _animateSettings() {
+        if (!this._alive) return;
+        if (this._orbTimer) GLib.Source.remove(this._orbTimer);
+        this._orbTimer = 0;
+        const target = !this._overviewActive() && (this._orbHover || this._orb.has_key_focus()) ? 1 : 0;
+        if (!St.Settings.get().enable_animations || this._overviewActive()) {
+            this._orbT = target;
+            this._orbVelocity = 0;
+            this._updateSettings();
+            return;
+        }
+        const start = this._orbT, velocity = this._orbVelocity;
+        const t0 = GLib.get_monotonic_time();
+        this._orbTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+            const seconds = (GLib.get_monotonic_time() - t0) / 1000000;
+            const sample = springSample(start, target, velocity, seconds, 0.36, 0.7);
+            this._orbT = sample.value;
+            this._orbVelocity = sample.velocity;
+            if (seconds >= 0.65) {
+                this._orbT = target;
+                this._orbVelocity = this._orbTimer = 0;
+            }
+            this._updateSettings();
+            return this._orbTimer ? GLib.SOURCE_CONTINUE : GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _updateSettings() {
+        this._orbDrawing.visible = this._orb.visible;
+        this._orbDrawing.queue_repaint();
+        this._orbGlyph.opacity = Math.round(255 * clampUnit(this._orbT) * clampUnit(this._orbReveal));
+        const scale = 0.5 + 0.5 * this._orbT;
+        this._orbGlyph.set_scale(scale, scale);
+        this._orbGlyph.rotation_angle_z = -60 * (1 - this._orbT);
+    }
+
+    _updateMotion() {
+        const enabled = this._enabled();
+        const size = this._notchSize(enabled.length);
+        const vertical = this._vertical();
+        const fullLength = Math.round(shapeLength(enabled.length, vertical));
+        const fullDepth = Math.round(LAYOUT.sideBodyDepth);
+        this._host.set_size(size.width, size.height);
+        this._notchBg.set_size(size.width, size.height);
+        this._notchBg.queue_repaint();
+        this._stack.set_size(vertical ? fullDepth : fullLength, vertical ? fullLength : fullDepth);
+        this._stack.set_position(this._edge() === 'right' ? size.width - fullDepth : 0,
+            this._edge() === 'bottom' ? size.height - fullDepth : 0);
+        // Contents retain their full layout while the outline swallows them.
+        const {curl} = notchGeometry(vertical ? size.width : size.height, vertical ? size.height : size.width);
+        const clipX = vertical ? -this._stack.x : curl;
+        const clipY = vertical ? curl : -this._stack.y;
+        this._stack.set_clip(clipX, clipY,
+            vertical ? size.width : Math.max(0, size.width - 2 * curl),
+            vertical ? Math.max(0, size.height - 2 * curl) : size.height);
+        this._stack.visible = this._expanded || this._expandT > 0.001;
+        this._stack.get_children().forEach((cell, index) => {
+            const progress = this._cellMotion.get(enabled[index])?.value ?? this._expandT;
+            cell.opacity = Math.round(255 * clampUnit(progress));
+            const offset = LAYOUT.bezelFillet * (1 - progress);
+            cell.translation_x = this._edge() === 'right' ? offset : this._edge() === 'left' ? -offset : 0;
+            cell.translation_y = this._edge() === 'bottom' ? offset : this._edge() === 'top' ? -offset : 0;
+            const button = cell.get_first_child();
+            button.reactive = this._expanded && this._expandT > 0.6;
+            button.can_focus = this._expanded;
+        });
+        this._orb.visible = this._orbReveal > 0.001 && enabled.length > 0;
+        this._orb.reactive = this._expanded && this._orbReveal > 0.5;
+        this._orb.can_focus = this._expanded;
+        this._updateSettings();
+        this._place();
     }
 
     _cancelActivity() {
@@ -366,20 +483,22 @@ export default class CodeNotch extends Extension {
 
     _mountDetail() {
         if (this._detailMounted) return;
-        Main.layoutManager.addChrome(this._detail, {affectsStruts: false, trackFullscreen: true});
+        const params = {affectsStruts: false, trackFullscreen: true};
+        if (this._detail.get_parent()) Main.layoutManager.trackChrome(this._detail, params);
+        else Main.layoutManager.addChrome(this._detail, params);
         this._detailMounted = true;
     }
 
     _unmountDetail() {
         if (!this._detailMounted) return;
-        // Content is rebuilt on every opening. Destroy it while still on-stage
-        // so theme updates cannot revisit detached labels during Overview.
+        // Release content and chrome visibility ownership, but keep the hidden
+        // root on-stage so pending Clutter allocations still have a theme context.
         this._detail.destroy_all_children();
         this._detailMounted = false;
-        Main.layoutManager.removeChrome(this._detail);
+        Main.layoutManager.untrackChrome(this._detail);
     }
 
-    _hideDetail(forceUnmount = false) {
+    _hideDetail() {
         if (this._hideTimer) GLib.Source.remove(this._hideTimer);
         this._hideTimer = 0;
         this._detail.hide();
@@ -388,13 +507,15 @@ export default class CodeNotch extends Extension {
         this._detail.translation_x = 0;
         this._detail.translation_y = 0;
         this._detailPositioned = false;
-        if (forceUnmount || this._overviewActive()) this._unmountDetail();
+        // Shell may set tracked chrome visible again on workspace/fullscreen
+        // changes. A dismissed popup must leave chrome, not merely hide.
+        this._unmountDetail();
     }
 
     _onOverviewShowing() {
         this._ignoreHover = true;
         this._keyboardOpen = false;
-        this._hideDetail(true);
+        this._hideDetail();
         // Settle transient hover expansion before Overview starts moving windows.
         if (this._motionTimer) GLib.Source.remove(this._motionTimer);
         this._motionTimer = 0;
@@ -402,21 +523,26 @@ export default class CodeNotch extends Extension {
         this._expandT = this._expandTarget = this._expanded ? 1 : 0;
         this._orb.remove_all_transitions();
         this._orbHover = false;
-        this._orb.opacity = 190;
+        if (this._orbTimer) GLib.Source.remove(this._orbTimer);
+        this._orbTimer = 0;
+        this._orbT = this._orbVelocity = this._expandVelocity = this._orbRevealVelocity = 0;
+        this._orbReveal = this._expandT;
+        for (const id of this._enabled()) this._cellMotion.set(id, {value: this._expandT, velocity: 0});
         this._render();
         const focus = global.stage.get_key_focus();
         if (focus && (this._host.contains(focus) || this._detail.contains(focus) || this._orb.contains(focus)))
             global.stage.set_key_focus(null);
     }
 
-    _onOverviewHiding() { this._hideDetail(true); }
+    _onOverviewHiding() { this._hideDetail(); }
     _onOverviewHidden() {
         this._ignoreHover = false;
         this._place();
     }
 
     _hover() {
-        if (this._overviewActive()) { this._hideDetail(true); return; }
+        if (!this._alive) return;
+        if (this._overviewActive()) { this._hideDetail(); return; }
         if (this._hideTimer) GLib.Source.remove(this._hideTimer);
         this._hideTimer = 0;
         if (this._host.hover || this._detail.hover || this._orb.hover) {
@@ -442,83 +568,69 @@ export default class CodeNotch extends Extension {
 
     _notchSize(count) {
         const vertical = this._vertical();
-        const expanded = this._expandT > 0.05;
-        if (!expanded) {
-            return vertical
-                ? {width: Math.round(LAYOUT.pillWidth), height: Math.round(LAYOUT.pillHeight)}
-                : {width: Math.round(LAYOUT.pillHeight), height: Math.round(LAYOUT.pillWidth)};
-        }
-        const length = Math.round(shapeLength(count, vertical));
-        const depth = Math.round(LAYOUT.sideBodyDepth);
+        const t = Math.max(0, this._expandT);
+        const length = Math.round(LAYOUT.pillHeight + (shapeLength(count, vertical) - LAYOUT.pillHeight) * t);
+        const depth = Math.round(LAYOUT.pillWidth + (LAYOUT.sideBodyDepth - LAYOUT.pillWidth) * t);
         return vertical ? {width: depth, height: length} : {width: length, height: depth};
     }
 
     _render() {
-        const focused = this._stack.get_children().indexOf(global.stage.get_key_focus());
-        const edge = this._edge();
+        const focused = this._stack.get_children().findIndex(cell => cell.contains(global.stage.get_key_focus()));
         const vertical = this._vertical();
         const enabled = this._enabled();
-        const expanded = this._expandT > 0.05;
-        const size = this._notchSize(enabled.length);
         this._rings = [];
         this._stack.destroy_all_children();
         this._stack.vertical = vertical;
         this._stack.x_align = Clutter.ActorAlign.CENTER;
         this._stack.y_align = Clutter.ActorAlign.CENTER;
-        const start = expanded ? Math.round(LAYOUT.curlRadius + LAYOUT.padTop) : 0;
-        const end = expanded ? Math.round(LAYOUT.curlRadius + LAYOUT.padBottom) : 0;
+        const start = Math.round(LAYOUT.curlRadius + LAYOUT.padTop);
+        const end = Math.round(LAYOUT.curlRadius + LAYOUT.padBottom);
         this._stack.set_style(`padding: ${vertical ? `${start}px 0 ${end}px` : `0 ${end}px 0 ${start}px`}; spacing: ${Math.round(LAYOUT.cellSpacing)}px;`);
 
-        this._host.set_size(size.width, size.height);
-        this._notchBg.set_size(size.width, size.height);
-        this._notchBg.queue_repaint();
+        enabled.forEach(id => {
+            const reading = this._readings.find(p => p.id === id);
+            const value = reading?.windows?.[0]?.usedPercent;
+            const stale = reading?.status !== 'ok';
+            const display = this._displayPercents[id] ?? value;
+            if (typeof value === 'number') this._displayPercents[id] = display ?? value;
 
-        if (expanded) {
-            enabled.forEach((id, index) => {
-                const reading = this._readings.find(p => p.id === id);
-                const value = reading?.windows?.[0]?.usedPercent;
-                const stale = reading?.status !== 'ok';
-                const display = this._displayPercents[id] ?? value;
-                if (typeof value === 'number') this._displayPercents[id] = display ?? value;
-
-                const cell = new St.BoxLayout({
-                    vertical: vertical, x_align: Clutter.ActorAlign.CENTER,
-                    opacity: Math.round(255 * Math.min(1, Math.max(0, this._expandT - index * 0.08))),
-                    style: `spacing: ${Math.round(LAYOUT.ringLabelGap)}px;`,
-                });
-                const button = new St.Button({
-                    style_class: 'codenotch-cell', can_focus: true, track_hover: true,
-                    accessible_name: `${NAMES[id]}: ${percentage(remainingPercent(value))} left${stale ? ', reading unavailable or stale' : ''}`,
-                });
-                const inner = new St.BoxLayout({vertical: vertical, x_align: Clutter.ActorAlign.CENTER, style: `spacing: ${Math.round(LAYOUT.ringLabelGap)}px;`});
-                const ring = new St.DrawingArea({width: LAYOUT.ringDiameter, height: LAYOUT.ringDiameter, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
-                const phase = GLib.get_monotonic_time() / 1000000;
-                ring.connect('repaint', area => {
-                    const cr = area.get_context();
-                    const [w, h] = area.get_surface_size();
-                    drawRing(cr, w, h, this._displayPercents[id] ?? value, stale, phase, this._sessions(id), id);
-                    cr.$dispose();
-                });
-                this._rings.push(ring);
-                inner.add_child(ring);
-                inner.add_child(new St.Label({text: percentage(remainingPercent(value)), style_class: 'codenotch-percent', x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER}));
-                button.set_child(inner);
-                button.connect('notify::hover', () => { if (button.hover && !this._overviewActive()) this._showDetail(id); });
-                button.connect('key-focus-in', () => { if (!this._overviewActive()) this._showDetail(id); });
-                button.connect('clicked', () => { if (!this._overviewActive()) this._showDetail(id); });
-                cell.add_child(button);
-                this._stack.add_child(cell);
+            const cell = new St.BoxLayout({
+                vertical: vertical, x_align: Clutter.ActorAlign.CENTER,
+                opacity: 255,
+                style: `spacing: ${Math.round(LAYOUT.ringLabelGap)}px;`,
             });
-        }
-
-        const orbSize = LAYOUT.settingsSize;
+            const button = new St.Button({
+                style_class: 'codenotch-cell', can_focus: true, track_hover: true,
+                accessible_name: `${NAMES[id]}: ${percentage(remainingPercent(value))} left${stale ? ', reading unavailable or stale' : ''}`,
+            });
+            const inner = new St.BoxLayout({vertical: vertical, x_align: Clutter.ActorAlign.CENTER, style: `spacing: ${Math.round(LAYOUT.ringLabelGap)}px;`});
+            const ring = new St.DrawingArea({width: LAYOUT.ringDiameter, height: LAYOUT.ringDiameter, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
+            ring.connect('repaint', area => {
+                const cr = area.get_context();
+                const [w, h] = area.get_surface_size();
+                drawRing(cr, w, h, this._displayPercents[id] ?? value, stale, GLib.get_monotonic_time() / 1000000, this._sessions(id), id);
+                cr.$dispose();
+            });
+            this._rings.push(ring);
+            inner.add_child(ring);
+            inner.add_child(new St.Label({text: percentage(remainingPercent(value)), style_class: 'codenotch-percent', x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER}));
+            button.set_child(inner);
+            button.connect('notify::hover', () => { if (button.hover && !this._overviewActive()) this._showDetail(id); });
+            button.connect('key-focus-in', () => { if (!this._overviewActive()) this._showDetail(id); });
+            button.connect('clicked', () => { if (!this._overviewActive()) this._showDetail(id); });
+            cell.add_child(button);
+            this._stack.add_child(cell);
+        });
+        const orbSize = Math.ceil(LAYOUT.settingsHotZone);
         this._orb.set_size(orbSize, orbSize);
         this._orbChrome.set_size(orbSize, orbSize);
-        this._orb.visible = expanded && enabled.length > 0;
+        this._orbDrawing.set_position((orbSize - 104) / 2, (orbSize - 104) / 2);
+        for (const id of enabled)
+            if (!this._cellMotion.has(id)) this._cellMotion.set(id, {value: this._expandT, velocity: 0});
 
         if (focused >= 0 && this._keyboardOpen)
-            this._stack.get_children()[Math.min(focused, this._stack.get_n_children() - 1)]?.grab_key_focus();
-        this._place();
+            this._stack.get_children()[Math.min(focused, this._stack.get_n_children() - 1)]?.get_first_child()?.grab_key_focus();
+        this._updateMotion();
         this._animateRings();
     }
 
@@ -530,7 +642,7 @@ export default class CodeNotch extends Extension {
     }
 
     _place() {
-        if (this._overviewActive()) this._hideDetail(true);
+        if (this._overviewActive()) this._hideDetail();
         const area = this._area();
         if (!area) return;
         const size = this._notchSize(this._enabled().length);
@@ -540,20 +652,15 @@ export default class CodeNotch extends Extension {
         if (this._orb.visible) {
             const edge = this._edge();
             let ox = p.x, oy = p.y;
-            const orbW = this._orb.width, orbH = this._orb.height;
-            if (edge === 'right') {
-                ox = p.x + size.width / 2 - orbW / 2;
-                oy = p.y + size.height - LAYOUT.curlRadius + LAYOUT.settingsGap;
-            } else if (edge === 'left') {
-                ox = p.x + size.width / 2 - orbW / 2;
-                oy = p.y + size.height - LAYOUT.curlRadius + LAYOUT.settingsGap;
-            } else if (edge === 'top') {
-                ox = p.x + size.width - LAYOUT.curlRadius + LAYOUT.settingsGap;
-                oy = p.y + size.height / 2 - orbH / 2;
-            } else {
-                ox = p.x + size.width - LAYOUT.curlRadius + LAYOUT.settingsGap;
-                oy = p.y + size.height / 2 - orbH / 2;
-            }
+            const vertical = this._vertical();
+            const {curl} = notchGeometry(vertical ? size.width : size.height, vertical ? size.height : size.width);
+            // Same centre as the far inverse corner, not the body centreline.
+            if (edge === 'right') { ox += size.width - curl; oy += size.height; }
+            else if (edge === 'left') { ox += curl; oy += size.height; }
+            else if (edge === 'top') { ox += size.width; oy += curl; }
+            else { ox += size.width; oy += size.height - curl; }
+            ox -= this._orb.width / 2;
+            oy -= this._orb.height / 2;
             this._orbChrome.set_position(Math.round(ox), Math.round(oy));
         }
         this._placeDetail();
@@ -598,7 +705,7 @@ export default class CodeNotch extends Extension {
     }
 
     _showDetail(id, refresh = false) {
-        if (this._overviewActive()) { this._hideDetail(true); return; }
+        if (this._overviewActive()) { this._hideDetail(); return; }
         if (this._detail.visible && this._selected === id && !refresh) return;
         const switching = this._detail.visible && this._selected !== id;
         const entering = !this._detail.visible;
@@ -610,6 +717,7 @@ export default class CodeNotch extends Extension {
         const direction = this._tooltipDirection();
         const horizontal = direction === 'leading' || direction === 'trailing';
         const wrap = new St.BoxLayout({vertical: !horizontal});
+        wrap.request_mode = Clutter.RequestMode.HEIGHT_FOR_WIDTH;
         const tail = new St.DrawingArea({
             width: horizontal ? LAYOUT.tailLength : LAYOUT.tailHeight,
             height: horizontal ? LAYOUT.tailHeight : LAYOUT.tailLength,
@@ -696,7 +804,7 @@ export default class CodeNotch extends Extension {
     }
 
     _placeDetail() {
-        if (this._overviewActive()) { this._hideDetail(true); return; }
+        if (this._overviewActive()) { this._hideDetail(); return; }
         if (!this._detail.visible) return;
         const area = this._area();
         if (!area) return;
@@ -743,12 +851,14 @@ export default class CodeNotch extends Extension {
         this._alive = false;
         this._cancelRead();
         this._cancelActivity();
-        for (const timer of [this._poll, this._hideTimer, this._activityPoll, this._animation, this._motionTimer])
+        for (const timer of [this._poll, this._hideTimer, this._activityPoll, this._animation, this._motionTimer, this._orbTimer])
             if (timer) GLib.Source.remove(timer);
-        this._poll = this._hideTimer = this._activityPoll = this._animation = this._motionTimer = 0;
+        this._poll = this._hideTimer = this._activityPoll = this._animation = this._motionTimer = this._orbTimer = 0;
         Main.wm.removeKeybinding('toggle-notch');
         if (this._monitorSignal) Main.layoutManager.disconnect(this._monitorSignal);
         if (this._workSignal) global.display.disconnect(this._workSignal);
+        if (this._workspaceSignal) global.workspace_manager.disconnect(this._workspaceSignal);
+        this._workspaceSignal = 0;
         if (this._overviewShowingSignal) Main.overview.disconnect(this._overviewShowingSignal);
         if (this._overviewHidingSignal) Main.overview.disconnect(this._overviewHidingSignal);
         if (this._overviewHiddenSignal) Main.overview.disconnect(this._overviewHiddenSignal);

@@ -45,6 +45,36 @@ export default class Smoke extends CodeNotch {
         super.enable();
         this.runSmoke().catch(error => GLib.file_set_contents(`${output}/result.json`, JSON.stringify({ok:false,error:String(error),stack:error.stack})));
     }
+    async capture(name) {
+        const stream = Gio.File.new_for_path(`${output}/${name}.png`).replace(null, false, Gio.FileCreateFlags.NONE, null);
+        const shot = new Shell.Screenshot();
+        await new Promise((resolve, reject) => shot.screenshot(false, stream, (object, result) => {
+            try { object.screenshot_finish(result); stream.close(null); resolve(); } catch (error) { reject(error); }
+        }));
+    }
+    async checkWorkspaceDismissal() {
+        const manager = global.workspace_manager;
+        const first = manager.get_workspace_by_index(0);
+        const second = manager.get_workspace_by_index(1);
+        assert(second, 'Workspace fixture has a second workspace');
+        for (const initiallyOpen of [false, true]) {
+            this._showDetail('claude', true);
+            await delay(100);
+            if (!initiallyOpen) {
+                this._hideDetail();
+                // Shell revisits tracked chrome visibility after fullscreen/Overview changes.
+                Main.layoutManager._updateVisibility();
+                assert(!this._detail.visible, 'Shell visibility update must not resurrect a dismissed popup');
+            }
+            second.activate(global.get_current_time());
+            await delay(650);
+            assert(manager.get_active_workspace() === second, 'Switched to second workspace');
+            assert(!this._detail.visible, `${initiallyOpen ? 'Open' : 'Dismissed'} popup must stay closed after workspace switch`);
+            first.activate(global.get_current_time());
+            await delay(650);
+            assert(!this._detail.visible, 'Returning to workspace must not resurrect popup');
+        }
+    }
     async runSmoke() {
         await delay(2200);
         Main.overview.hide();
@@ -52,6 +82,91 @@ export default class Smoke extends CodeNotch {
         assert(this._readings.length === 3, 'Three providers must render');
         assert(this._readings.every(p => p.windows.length && p.status === 'ok'), 'Demo readings must succeed');
         assert(this._activities.length === 3, 'Activity demo reader succeeds');
+        await this.checkWorkspaceDismissal();
+        // Wrapped provider warnings must participate in the card's natural height.
+        const savedReadings = this._readings;
+        const savedSessions = this._sessions;
+        this._sessions = () => []; // Keep background activity polling out of this layout fixture.
+        const warning = 'Claude Code credentials have expired; use Claude Code to refresh them';
+        for (const edge of ['right', 'top', 'left', 'bottom']) {
+            this._settings.set_string('edge', edge);
+            await delay(100);
+            const heights = [];
+            for (const message of [warning, `${warning}. ${warning}.`, 'Usage unavailable']) {
+                this._readings = savedReadings.map(p => p.id === 'claude' ? {...p,
+                    status: 'stale', message,
+                } : p);
+                this._showDetail('claude', true);
+                await delay(200);
+                const card = this._detail.get_first_child().get_children()
+                    .find(child => child.has_style_class_name('codenotch-detail'));
+                const actions = card.get_last_child();
+                const footerInset = card.height - actions.y - actions.height;
+                assert(Math.abs(footerInset - 16) <= 1,
+                    `${edge}: wrapped warning preserves 16px footer inset, got ${footerInset}`);
+                heights.push(card.height);
+                if (edge === 'right' && message === warning) await this.capture('wrapped-warning');
+            }
+            assert(heights[1] > heights[0] && heights[2] < heights[0],
+                `${edge}: popup grows and shrinks with wrapped content (${heights})`);
+        }
+        this._readings = savedReadings;
+        this._sessions = savedSessions;
+        this._hideDetail();
+        // Real pointer input exercises picking across the separately tracked
+        // arc and notch actors, rather than assigning their hover flags.
+        const pointer = Clutter.get_default_backend().get_default_seat()
+            .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        const move = (x, y) => pointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y);
+        this._settings.set_string('edge', 'right');
+        await delay(850);
+        global.stage.set_key_focus(null);
+        move(400, 400);
+        await delay(100);
+        await this.capture('settings-arc');
+        const orbX = this._orbChrome.x + this._orb.width / 2;
+        const orbY = this._orbChrome.y + this._orb.height / 2;
+        move(orbX, orbY);
+        await delay(90);
+        assert(this._orb.hover && this._orbT > 0 && this._orbT < 1, 'Pointer starts a continuous arc-to-gear transition');
+        await this.capture('settings-transition');
+        await delay(650);
+        assert(this._orbT === 1 && this._orbGlyph.opacity === 255, 'Hovered settings gear settles fully visible');
+        await this.capture('settings-gear');
+        let settingsOpened = false;
+        const openPreferences = this.openPreferences;
+        this.openPreferences = () => { settingsOpened = true; };
+        this._orb.emit('clicked', 1);
+        assert(settingsOpened, 'Settings control still opens preferences');
+        this.openPreferences = openPreferences;
+        move(400, 400);
+        await delay(90);
+        await this.capture('settings-return');
+        await delay(650);
+        assert(this._orbT === 0 && this._orbGlyph.opacity === 0, 'Leaving settings restores only the arc');
+        this._settings.set_boolean('always-show', false);
+        await delay(850);
+        assert(this._host.width === 10 && this._host.height === 79, 'Reference handle is 10 by 79');
+        assert(!this._orb.visible && !this._orbDrawing.visible, 'Collapsed handle has no settings residue');
+        await this.capture('closed-handle');
+        const firstCell = this._stack.get_first_child();
+        move(1278, this._host.y + this._host.height / 2);
+        await delay(80);
+        assert(this._host.width > 10 && this._host.width < 70, 'Unfold interpolates size instead of snapping');
+        assert(this._stack.get_first_child() === firstCell, 'Animation preserves provider actors');
+        await this.capture('unfold-intermediate');
+        await delay(850);
+        assert(this._host.width === 70 && this._orb.visible, 'Hover unfolds the whole notch');
+        // Reverse the fold while it is still in flight.
+        move(400, 400);
+        await delay(380);
+        assert(this._expandT > 0 && this._expandT < 1, 'Pointer departure starts folding after grace period');
+        move(1278, this._host.y + this._host.height / 2);
+        await delay(850);
+        assert(this._expandT === 1 && !this._motionTimer, 'Re-entry reverses and settles the spring');
+        this._settings.set_boolean('always-show', true);
+        move(400, 400);
+        await delay(850);
         this._keyboardOpen = true;
         const buttons = this._stack.get_children().map(c => c.get_first_child()).filter(Boolean);
         buttons[0].grab_key_focus();
@@ -120,6 +235,12 @@ export default class Smoke extends CodeNotch {
         interfaceSettings.set_boolean('enable-animations', false);
         await delay(100);
         assert(!St.Settings.get().enable_animations, 'GNOME reduced motion setting propagates');
+        this._orb.grab_key_focus();
+        this._animateSettings();
+        assert(this._orbT === 1 && !this._orbTimer, 'Reduced motion reveals focused gear immediately');
+        global.stage.set_key_focus(null);
+        this._animateSettings();
+        assert(this._orbT === 0 && !this._orbTimer, 'Reduced motion restores arc immediately');
         this._showDetail('claude');
         await delay(60);
         assert(this._detail.translation_x === 0 && this._detail.translation_y === 0, 'Reduced motion places popup immediately');
@@ -154,7 +275,7 @@ export default class Smoke extends CodeNotch {
         Main.overview.show();
         await delay(100);
         assert(!this._motionTimer && this._expandT === 0, 'Overview settles transient expansion and cancels motion');
-        assert(!this._orb.visible, 'Overview must not revive the collapsed settings button');
+        assert(!this._orb.visible && !this._orbDrawing.visible, 'Overview must not revive the collapsed settings button');
         const overviewArea = this._area();
         assert(Math.abs(this._host.x + this._host.width - overviewArea.x - overviewArea.width) <= 1,
             'Collapsed handle stays attached to the edge during Overview');
@@ -194,13 +315,17 @@ export default class Smoke extends CodeNotch {
             try { p.wait_check_finish(result); resolve(); } catch (error) { reject(error); }
         }));
         assert(GLib.file_test(`${output}/prefs.json`, GLib.FileTest.EXISTS), 'Preferences constructed and presented');
+        this._orb.grab_key_focus();
+        await delay(80);
+        assert(this._orbTimer, 'Exercise disable while the focused gear is moving');
         super.disable();
-        assert(!this._poll && !this._activityPoll && !this._animation && !this._process && !this._activityProcess && !this._host, 'Disable releases owned resources');
+        assert(!this._orbTimer && !this._motionTimer && !this._poll && !this._activityPoll && !this._animation && !this._process && !this._activityProcess && !this._host, 'Disable releases owned resources');
         super.enable();
         await delay(600);
         assert(this._readings.length === 2, 'Re-enable works');
+        await this.checkWorkspaceDismissal();
         super.disable();
-        GLib.file_set_contents(`${output}/result.json`, JSON.stringify({ok:true, placements, checks:['demo reader','four edges','tooltip','rapid popup switching','reduced motion','Overview dismissal','Overview collapse race','Overview visibility across four edges','always-show Overview','provider disable','collapse','preferences window','disable','re-enable']}));
+        GLib.file_set_contents(`${output}/result.json`, JSON.stringify({ok:true, placements, checks:['workspace switch dismissal and return','dismissed chrome visibility','wrapped warning padding and dynamic height across four edges','reference handle dimensions','pointer arc-to-gear transition','settings click','continuous unfold','animation actor identity','interrupted fold reversal','demo reader','four edges','tooltip','rapid popup switching','reduced motion','Overview dismissal','Overview collapse race','Overview visibility across four edges','always-show Overview','provider disable','collapse','preferences window','disable','re-enable']}));
     }
 }
 ''')
@@ -211,11 +336,13 @@ export default class Smoke extends CodeNotch {
     # Isolated keyfile settings, never the user's dconf database.
     subprocess.run(['gsettings', 'set', 'org.gnome.shell', 'enabled-extensions', "['codenotch@local']"], env=env, check=True)
     subprocess.run(['gsettings', 'set', 'org.gnome.shell', 'disable-user-extensions', 'false'], env=env, check=True)
+    subprocess.run(['gsettings', 'set', 'org.gnome.mutter', 'dynamic-workspaces', 'false'], env=env, check=True)
+    subprocess.run(['gsettings', 'set', 'org.gnome.desktop.wm.preferences', 'num-workspaces', '2'], env=env, check=True)
     with (OUTPUT / 'shell.log').open('w') as log:
         process = subprocess.Popen(['dbus-run-session', '--', 'gnome-shell', '--headless', '--wayland', '--no-x11',
                                     '--virtual-monitor', '1280x800'], env=env, stdout=log, stderr=log, start_new_session=True)
         try:
-            deadline = time.monotonic() + 40
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline and process.poll() is None and not report.exists():
                 time.sleep(0.25)
         finally:
